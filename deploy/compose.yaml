@@ -1,0 +1,154 @@
+# 秒新加湿器 · 本地 HomeKit 桥接
+#
+# 三层拓扑：
+#   gateway(25886/25887) ← 设备 MQTT → mqtt(1883) → bridge(25888) → hap(51826) → 家庭 App
+#
+# 用法：
+#   1. ./scripts/bootstrap.sh        生成 secrets/ 与 deploy/.env
+#   2. docker compose -f deploy/compose.yaml up -d
+#
+# 注意：hap 必须使用 host 网络，否则 mDNS 广播出不了容器，家庭 App 发现不了配件。
+
+name: airmx-homekit
+
+services:
+  gateway:
+    build: .
+    image: airmx-homekit-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    pids_limit: 64
+    environment:
+      AIRMX_BIND_HOST: 0.0.0.0
+      AIRMX_MQTT_HOST: mqtt
+      # 允许设备所在网段。默认放行私有网段，请按需收紧。
+      AIRMX_DEVICE_CIDRS: ${AIRMX_DEVICE_CIDRS:-127.0.0.1/32,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+      AIRMX_DATA_DIR: /data
+      AIRMX_TOKEN_FILE: /run/secrets/admin_token
+      AIRMX_MASTER_KEY_FILE: /run/secrets/master_key
+    ports:
+      - "${GATEWAY_PORT:-25886}:8080"
+      - "${GATEWAY_ADMIN_PORT:-25887}:8086"
+    volumes:
+      - gateway_data:/data
+      - ./airmx_gateway:/app/airmx_gateway:ro
+    secrets: [admin_token, master_key]
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    networks: [airmx_private]
+    depends_on: [mqtt]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 2m, max-file: "2"}
+
+  mqtt:
+    image: eclipse-mosquitto:2.0.22
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 48m
+    pids_limit: 32
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./deploy/diagnostic.acl:/mosquitto/config/diagnostic.acl:ro
+    tmpfs:
+      - /tmp:size=4m,noexec,nosuid
+    networks: [airmx_private]
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: "2"}
+
+  bridge:
+    build: .
+    image: airmx-homekit-gateway
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 64
+    environment:
+      AIRMX_MQTT_HOST: mqtt
+      AIRMX_MQTT_PORT: "1883"
+      BRIDGE_PORT: "8088"
+      BRIDGE_STATE_FILE: /data/bridge_state.json
+      BRIDGE_POLL_SECONDS: "60"
+      AIRMX_GATEWAY_URL: http://gateway:8086
+      AIRMX_TOKEN_FILE: /run/secrets/admin_token
+      # 与 hap 共用同一个 token，由 bootstrap.sh 生成
+      BRIDGE_API_TOKEN: ${AIRMX_BRIDGE_TOKEN:?请先运行 scripts/bootstrap.sh}
+    command: ["python", "/app/bridge/bridge.py"]
+    volumes:
+      - ./bridge:/app/bridge:ro
+      - bridge_data:/data
+    secrets: [admin_token]
+    ports:
+      - "${BRIDGE_PORT:-25888}:8088"
+    networks: [airmx_private]
+    depends_on: [mqtt]
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: "2"}
+
+  hap:
+    build:
+      context: .
+      dockerfile: hap/Dockerfile
+    restart: unless-stopped
+    # host 网络：mDNS 广播必须能出容器
+    network_mode: host
+    # 以 root 启动仅用于修正 /data 属主，进程随后自降权到 10001
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 64
+    environment:
+      AIRMX_BRIDGE_URL: http://127.0.0.1:${BRIDGE_PORT:-25888}
+      AIRMX_BRIDGE_TOKEN: ${AIRMX_BRIDGE_TOKEN:?请先运行 scripts/bootstrap.sh}
+      AIRMX_HAP_PORT: ${AIRMX_HAP_PORT:-51826}
+      AIRMX_HAP_STATUS_PORT: ${AIRMX_HAP_STATUS_PORT:-51827}
+      AIRMX_HAP_PINCODE: ${AIRMX_HAP_PINCODE:-031-45-154}
+      AIRMX_HAP_STATE: /data/hap.state
+      AIRMX_HAP_BRIDGE_NAME: ${AIRMX_HAP_BRIDGE_NAME:-秒新加湿器}
+      AIRMX_HAP_NAME_PREFIX: ${AIRMX_HAP_NAME_PREFIX:-加湿器}
+      AIRMX_HAP_POLL_SECONDS: "8"
+      AIRMX_HAP_PROFILE: ${AIRMX_HAP_PROFILE:-full}
+      AIRMX_LOG_LEVEL: ${AIRMX_LOG_LEVEL:-INFO}
+    volumes:
+      # 用宿主目录而不是命名卷：状态文件可直接检查，丢了就等于要重新配对
+      - ./data:/data
+      - ./hap:/app/hap:ro
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    depends_on: [bridge]
+    logging:
+      driver: json-file
+      options: {max-size: 2m, max-file: "2"}
+
+networks:
+  airmx_private:
+    driver: bridge
+
+volumes:
+  gateway_data:
+  bridge_data:
+
+secrets:
+  admin_token:
+    file: ./secrets/admin_token
+  master_key:
+    file: ./secrets/master_key
